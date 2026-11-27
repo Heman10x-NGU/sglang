@@ -686,6 +686,7 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        new_node.creation_time = child.creation_time
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref

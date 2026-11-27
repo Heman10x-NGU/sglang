@@ -3,13 +3,16 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     EvictResult,
+    InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -72,7 +75,7 @@ class _FakeAllocator:
         self.window_freed.extend(indices.tolist())
 
 
-def _make_cache(*, disable, num_tokens, page_size=1):
+def _make_cache(*, disable, num_tokens, page_size=1, eviction_policy="lru"):
     req_to_token_pool = _FakeReqToTokenPool(
         torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
     )
@@ -87,6 +90,7 @@ def _make_cache(*, disable, num_tokens, page_size=1):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=4,
+            eviction_policy=eviction_policy,
         )
     )
 
@@ -188,6 +192,78 @@ class TestPureSWADecodeReclaim(CustomTestCase):
 
         self.assertEqual(len(evicted), 1)
         self.assertEqual(evicted[0].num_tokens, 4)
+
+
+class TestRadixSplitCreationTime(CustomTestCase):
+    def test_fifo_eviction_preserves_creation_time_across_node_split(self):
+        """Splitting an older node must keep its original creation_time so FIFO
+        evicts the split prefix before a branch inserted later."""
+        clock = iter(float(i) for i in range(1, 100))
+        with mock.patch(
+            "sglang.srt.mem_cache.radix_cache.time.monotonic", side_effect=clock
+        ):
+            cache = _make_cache(disable=False, num_tokens=16, eviction_policy="fifo")
+            branch_a = RadixKey(array("q", [1, 2, 3, 4]))
+            branch_b = RadixKey(array("q", [10, 11, 12, 13]))
+            cache.insert(
+                InsertParams(key=branch_a, value=torch.arange(4, dtype=torch.int64))
+            )
+            cache.insert(
+                InsertParams(key=branch_b, value=torch.arange(4, 8, dtype=torch.int64))
+            )
+
+            # Split branch_a into prefix [1, 2] and suffix [3, 4] after branch_b exists.
+            split_match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [1, 2])))
+            )
+            self.assertEqual(split_match.device_prefix_len, 2)
+
+            # Evicting 4 tokens must drop branch_a's suffix [3, 4] and then its
+            # prefix [1, 2], leaving the newer branch_b cached.
+            evict_result = cache.evict(EvictParams(num_tokens=4))
+            self.assertEqual(evict_result.num_tokens_evicted, 4)
+
+            self.assertEqual(
+                cache.match_prefix(MatchPrefixParams(key=branch_a)).device_prefix_len, 0
+            )
+            self.assertEqual(
+                cache.match_prefix(MatchPrefixParams(key=branch_b)).device_prefix_len, 4
+            )
+
+    def test_filo_eviction_preserves_creation_time_across_node_split(self):
+        """Splitting an older node must not make its prefix look newer than a
+        later-inserted branch under FILO eviction."""
+        clock = iter(float(i) for i in range(1, 100))
+        with mock.patch(
+            "sglang.srt.mem_cache.radix_cache.time.monotonic", side_effect=clock
+        ):
+            cache = _make_cache(disable=False, num_tokens=16, eviction_policy="filo")
+            branch_a = RadixKey(array("q", [1, 2, 3, 4]))
+            branch_b = RadixKey(array("q", [10, 11, 12, 13]))
+            cache.insert(
+                InsertParams(key=branch_a, value=torch.arange(4, dtype=torch.int64))
+            )
+            res_b = cache.insert(
+                InsertParams(key=branch_b, value=torch.arange(4, 8, dtype=torch.int64))
+            )
+
+            # Split branch_a after branch_b was inserted.
+            cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", [1, 2]))))
+
+            # Evict branch_a's suffix while branch_b is locked so prefix [1, 2]
+            # becomes an evictable leaf alongside branch_b.
+            lock_b = cache.lock(res_b.last_device_node)
+            cache.evict(EvictParams(num_tokens=2))
+            cache.unlock(lock_b)
+
+            # FILO must evict the newer branch_b before branch_a's older prefix.
+            cache.evict(EvictParams(num_tokens=2))
+            self.assertEqual(
+                cache.match_prefix(MatchPrefixParams(key=branch_b)).device_prefix_len, 0
+            )
+            self.assertEqual(
+                cache.match_prefix(MatchPrefixParams(key=branch_a)).device_prefix_len, 2
+            )
 
 
 if __name__ == "__main__":
